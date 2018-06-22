@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	policylisters "k8s.io/client-go/listers/policy/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -114,6 +115,9 @@ type TFJobController struct {
 	// serviceLister can list/get services from the shared informer's store.
 	serviceLister corelisters.ServiceLister
 
+	// pdbLister can list/get pdbs from the shared informer's store.
+	pdbLister policylisters.PodDisruptionBudgetLister
+
 	// tfJobInformerSynced returns true if the tfjob store has been synced at least once.
 	tfJobInformerSynced cache.InformerSynced
 
@@ -122,6 +126,9 @@ type TFJobController struct {
 
 	// serviceInformerSynced returns true if the service store has been synced at least once.
 	serviceInformerSynced cache.InformerSynced
+
+	// pdbInformerSynced returns true if the pod store has been synced at least once.
+	pdbInformerSynced cache.InformerSynced
 
 	// A TTLCache of pod/services creates/deletes each tfjob expects to see
 	// We use TFJob namespace/name + TFReplicaType + pods/services as an expectation key,
@@ -236,6 +243,17 @@ func NewTFJobController(
 	tc.serviceLister = serviceInformer.Lister()
 	tc.serviceInformerSynced = serviceInformer.Informer().HasSynced
 
+	pdbInformer := kubeInformerFactory.Policy().V1beta1().PodDisruptionBudgets()
+
+	pdbInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    tc.addPdb,
+		UpdateFunc: tc.updatePdb,
+		DeleteFunc: tc.deletePdb,
+	})
+
+	tc.pdbLister = pdbInformer.Lister()
+	tc.pdbInformerSynced = pdbInformer.Informer().HasSynced
+
 	return tc
 }
 
@@ -262,6 +280,10 @@ func (tc *TFJobController) Run(threadiness int, stopCh <-chan struct{}) error {
 
 	if ok := cache.WaitForCacheSync(stopCh, tc.serviceInformerSynced); !ok {
 		return fmt.Errorf("failed to wait for service caches to sync")
+	}
+
+	if ok := cache.WaitForCacheSync(stopCh, tc.pdbInformerSynced); !ok {
+		return fmt.Errorf("failed to wait for pdb caches to sync")
 	}
 
 	log.Infof("Starting %v workers", threadiness)
@@ -425,6 +447,12 @@ func (tc *TFJobController) reconcileTFJobs(tfjob *tfv1alpha2.TFJob) error {
 			log.Infof("reconcileServices error %v", err)
 			return err
 		}
+	}
+
+	err = tc.reconcilePdb(tfjob)
+	if err != nil {
+		log.Infof("reconcilePdb error %v", err)
+		return err
 	}
 
 	// TODO(CPH): Add check here, no need to update the tfjob if the status hasn't changed since last time.
